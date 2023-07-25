@@ -1,0 +1,286 @@
+---
+title: "Data preparation"
+output:
+  pdf_document: default
+---
+
+# Instructions
+
+- You only need to submit the .Rmd of this file, not a PDF.
+
+- You should __comment__ your code clearly to show what you've done to prepare the data.
+
+- The purpose of this file is to use the data in the `data-raw` folder to create the data you will use in the report. The data you will use in the report should be saved in the `data` folder. It is good professional practice to make sure you're never directly modifying your raw data, but instead creating new datasets based on merges/manipulations that you need to reuse.
+
+- Make sure you've taken a look at the hints for the web scraping and census API. 
+
+- You may find the `write_rds()` function from the `readr` package helpful (it is loaded as part of the `tidyverse`).
+
+- You do not need to keep the structure below.
+
+# Set up
+
+```{r, libraries}
+# Set up any libraries you need
+library(tidyverse)
+library(polite)
+library(rvest)
+library(haven)
+library(lme4)
+library(eeptools)
+library(knitr)
+library(sjPlot)
+library(cancensus)
+library(janitor)
+```
+
+# Loading client data
+
+```{r}
+customer <- read_rds("data-raw/customer.Rds")
+device <- read_rds("data-raw/device.Rds")
+cust_sleep <- read_rds("data-raw/cust_sleep.Rds")
+cust_dev <- read_rds("data-raw/cust_dev.Rds")
+break_glass <- read_rds("data-raw/break_glass_in_case_of_emergency.Rds")
+```
+
+## Web scraping industry data
+
+```{r}
+url <- "https://fitnesstrackerinfohub.netlify.app/"
+target <- bow(url,
+              user_agent = "alexandertran.tran@mail.utoronto.ca for STA303/1002 project",
+              force = TRUE)
+target
+
+html <- scrape(target)
+
+device_data <- html %>% 
+  html_elements("table") %>% 
+  html_table() %>% 
+  pluck(1) # added, in case you're getting a list formats
+
+```
+## Postcode
+
+```{r}
+postcode <- read_sav("pccfNat_fccpNat_082021sav.sav", col_select = c("PC", "CSDuid"))
+
+```
+
+## Census API
+
+```{r}
+options(cancensus.api_key = "CensusMapper_e044495035736957fbd42a934af93f49",
+        cancensus.cache_path = "cache") # this sets a folder for your cache
+
+
+# get all regions as at the 2016 Census (2020 not up yet)
+regions <- list_census_regions(dataset = "CA16")
+
+regions_filtered <-  regions %>% 
+  filter(level == "CSD") %>% # Figure out what CSD means in Census data
+  as_census_region_list()
+
+
+
+# This can take a while
+# We want to get household median income
+census_data_csd <- get_census(dataset='CA16', regions = regions_filtered,
+                          vectors=c("v_CA16_2397"), 
+                          level='CSD', geo_format = "sf")
+
+
+#Simplify to only needed variables
+
+median_income <- census_data_csd %>% 
+  as_tibble() %>% 
+  select(CSDuid = GeoUID, contains("median"), Population) %>% 
+  mutate(CSDuid = parse_number(CSDuid)) %>% 
+  rename(hhld_median_inc = 2)
+```
+## Data cleaning and processing
+
+```{r}
+# Rename the column of device_data so that we can combine it with device
+device_data_adj <- clean_names(device_data) %>% mutate(released=as.Date(released))
+
+# Set the released column in device into date type 
+device_adj <- clean_names(device) %>% mutate(released=as.Date(released))
+
+# Join device_adj and device_data_adj
+device_full <- device_adj %>% right_join(device_data_adj, by=c("line", "device_name", "released"))
+
+cust_dev_joined <- cust_sleep %>% left_join(customer, by="cust_id") %>% left_join(cust_dev, by="cust_id") %>% left_join(device_full, by="dev_id")
+
+# Clean the postcode data and create a new dataframe postcode_adj
+postcode_adj <- clean_names(postcode)
+postcode_adj <- rename(postcode_adj, postcode=pc)
+
+# Clean the median_income data and create a new dataframe median_income_adj
+# Combine median_income_adj and postcode_adj
+median_income_adj <- clean_names(median_income)
+pc_income <- postcode_adj %>% left_join(median_income_adj, by="cs_duid")
+
+# Combining with postal code and income
+cust_dev_joined <- cust_dev_joined %>% left_join(pc_income, by="postcode")
+
+# Cleaning variables of interest
+cust_dev_joined <- cust_dev_joined %>% mutate(dob=as.Date(dob))
+cust_dev_joined <- cust_dev_joined %>% mutate(age=floor(age_calc(dob, units = "years")))
+cust_dev_joined <- cust_dev_joined %>% drop_na(cust_id)
+cust_dev_joined$emoji_modifier[is.na(cust_dev_joined$emoji_modifier)] <- "Not Set"
+cust_dev_joined$sex[is.na(cust_dev_joined$sex)] <- "Not Set"
+```
+
+## Initial Exploratory Data Analysis
+
+```{r}
+#Data summaries
+#Note that means and variances are calculated as a flag rate of per 60 minutes of sleep
+cust_dev_joined %>% group_by(emoji_modifier) %>% summarise(n = n(), mean = mean(flags*60/duration), median = median(flags*60/duration), sd = sd(flags*60/duration), var = var(flags*60/duration))
+
+cust_dev_joined %>% group_by(sex) %>% summarise(n = n(), mean = mean(flags*60/duration), median = median(flags*60/duration), sd = sd(flags*60/duration), var = var(flags*60/duration))
+
+cust_dev_joined %>% mutate(age_bracket = cut(age, breaks = seq(15, 95, by=5))) %>%  group_by(age_bracket) %>% summarise(n = n(), mean = mean(flags*60/duration), median = median(flags*60/duration), sd = sd(flags*60/duration), var = var(flags*60/duration))
+
+cust_dev_joined %>% group_by(device_name) %>% summarise(n = n(), mean = mean(flags*60/duration), median = median(flags*60/duration), sd = sd(flags*60/duration), var = var(flags*60/duration))
+
+cust_dev_joined %>% mutate(income_bracket = cut(hhld_median_inc, breaks = seq(40000, 120000, by=10000))) %>%  group_by(income_bracket) %>% summarise(n = n(), mean = mean(flags*60/duration), median = median(flags*60/duration), sd = sd(flags*60/duration), var = var(flags*60/duration))
+```
+
+```{r}
+#Visualize flags distribution through histograms
+cust_dev_joined %>% ggplot(aes(x = flags)) + geom_histogram(colour="black", fill="white", binwidth=0.5) + labs(title="Distribution of Flags for all Sleep Sessions",x="Flags", y = "Frequency") + theme_minimal()
+
+#By emoji_modifier
+cust_dev_joined %>% ggplot(aes(x = flags)) + geom_histogram(colour="black", fill="white", binwidth=0.5) + labs(title="Distribution of Flags by Emoji Modifier",x="Flags", y = "Frequency") + theme_minimal() + facet_wrap(~emoji_modifier, nrow = 3)
+
+#By sex
+cust_dev_joined %>% ggplot(aes(x = flags)) + geom_histogram(colour="black", fill="white", binwidth=0.5) + labs(title="Distribution of Flags by Sex",x="Flags", y = "Frequency") +  theme_minimal() + facet_wrap(~sex, nrow = 1)
+
+#By device
+cust_dev_joined %>% ggplot(aes(x = flags)) + geom_histogram(colour="black", fill="white", binwidth=0.5) + labs(title="Distribution of Flags By Device",x="Flags", y = "Frequency") + theme_minimal() + facet_wrap(~device_name, nrow = 4)
+
+#By age
+cust_dev_joined %>% mutate(age_bracket = cut(age, breaks = seq(15, 95, by=5))) %>% ggplot(aes(x = flags)) + geom_histogram(colour="black", fill="white", binwidth=0.5) + labs(title="Distribution of Flags By Age Bracket",x="Flags", y = "Frequency") + theme_minimal() + facet_wrap(~age_bracket, nrow = 4)
+
+#By income_bracket
+cust_dev_joined %>% mutate(income_bracket = cut(hhld_median_inc, breaks = seq(40000, 115000, by=5000), labels = c("(40000, 45000]", "(45000, 50000]", "(50000, 55000]", "(55000, 60000]", "(60000, 65000]", "(65000, 70000]", "(70000, 75000]", "(75000, 80000]", "(80000, 85000]", "(85000, 90000]", "(90000, 95000]", "(95000, 100000]", "(100000, 105000]", "(105000, 110000]", "(110000, 115000]"))) %>% ggplot(aes(x = flags)) + geom_histogram(colour="black", fill="white", binwidth=0.5) + labs(title="Distribution of Flags By Income Bracket",x="Flags", y = "Frequency") + theme_minimal()+ facet_wrap(~income_bracket, nrow = 3)
+```
+
+```{r}
+#Plot with variables duration and flags to identify any correlation between them and other variables
+#Emoji modifiers from B to F is from light to dark skin tone
+cust_dev_joined %>% group_by(emoji_modifier) %>% ggplot(aes(x=duration, y=flags, colour = emoji_modifier)) + geom_point(size=0.1) + theme_minimal() + geom_smooth(method=lm, se=FALSE, fullrange=TRUE) + labs(title="Flags vs Duration, by Emoji Modifier",x="Duration (Minutes)", y = "Flags")
+
+#Separated by emoji_modifer
+cust_dev_joined %>% group_by(emoji_modifier) %>% ggplot(aes(x=duration, y=flags, colour = emoji_modifier)) + geom_point(size=0.1) + theme_minimal() + geom_smooth(method=lm, se=FALSE, fullrange=TRUE) + labs(title="Flags vs Duration, by Emoji Modifier",x="Duration (Minutes)", y = "Flags", colour = "Emoji Modifier") + facet_wrap(~emoji_modifier, nrow = 2)
+
+#Separated by sex
+cust_dev_joined %>% group_by(sex) %>% ggplot(aes(x=duration, y=flags, colour = sex)) + geom_point(size=0.1) + theme_minimal() + geom_smooth(method=lm, se=FALSE, fullrange=TRUE) +  labs(title="Flags vs Duration, by Sex",x="Duration (Minutes)", y = "Flags", colour = "Sex") + facet_wrap(~sex, nrow = 2)
+
+#Separated by device_name
+cust_dev_joined %>% group_by(device_name) %>% ggplot(aes(x=duration, y=flags, colour = device_name)) + geom_point(size=0.1) + theme_minimal() + geom_smooth(method=lm, se=FALSE, fullrange=TRUE) + labs(title="Flags vs Duration, by Device",x="Duration (Minutes)", y = "Flags", colour = "Device") + facet_wrap(~device_name, nrow = 4)
+
+#Separated by age
+cust_dev_joined %>% mutate(age_bracket = cut(age, breaks = seq(15, 95, by=5))) %>% group_by(age_bracket) %>% ggplot(aes(x=duration, y=flags, colour = age_bracket)) + geom_point(size=0.1) + theme_minimal() + geom_smooth(method=lm, se=FALSE, fullrange=TRUE) + labs(title="Flags vs Duration, by Age Bracket",x="Duration (Minutes)", y = "Flags", colour = "Age Bracket") + facet_wrap(~age_bracket, nrow = 4)
+
+#Separated by income
+cust_dev_joined %>% mutate(income_bracket = cut(hhld_median_inc, breaks = seq(40000, 115000, by=5000), labels = c("(40000, 45000]", "(45000, 50000]", "(50000, 55000]", "(55000, 60000]", "(60000, 65000]", "(65000, 70000]", "(70000, 75000]", "(75000, 80000]", "(80000, 85000]", "(85000, 90000]", "(90000, 95000]", "(95000, 100000]", "(100000, 105000]", "(105000, 110000]", "(110000, 115000]"))) %>% group_by(income_bracket) %>% ggplot(aes(x=duration, y=flags, colour = income_bracket)) + geom_point(size=0.1) + theme_minimal() + geom_smooth(method=lm, se=FALSE, fullrange=TRUE) + labs(title="Flags vs Duration, by Income Bracket",x="Duration (Minutes)", y = "Flags", colour = "Income Bracket") + facet_wrap(~income_bracket, nrow = 3)
+```
+```{r}
+#Checking how age affects flags for different emoji_modifiers
+cust_dev_joined %>% group_by(emoji_modifier) %>% ggplot(aes(x=age, y=flags, colour = emoji_modifier)) + geom_point(size=0.5) + theme_minimal() + geom_smooth(method=lm, se=FALSE, fullrange=TRUE) + labs(title="Flags vs Age, by Emoji Modifer",x="Age", y = "Flags", colour = "Emoji Modifier")
+
+#Checking how income affects flags for different emoji_modifiers
+cust_dev_joined %>% group_by(emoji_modifier) %>% ggplot(aes(x=hhld_median_inc, y=flags, colour = emoji_modifier)) + geom_point(size=0.5) + theme_minimal() + geom_smooth(method=lm, se=FALSE, fullrange=TRUE) + labs(title="Flags vs Household Median Income, by Emoji Modifier",x="Household Median Income", y = "Flags", colour = "Emoji Modifier")
+```
+
+
+```{r}
+#Plotting log means of flags by age to check for linearity
+#Interesting behaviour, weakly linear
+cust_dev_joined %>% group_by(age) %>% summarise(flags=mean(flags)) %>% ggplot(aes(x=age, y=log(flags))) + geom_point() + geom_smooth() + theme_minimal() + labs(title="Log of Emperical Mean Flags by Age",x="Age", y = "log(Mean Flags)")
+
+cust_dev_joined %>% group_by(age, emoji_modifier) %>% summarise(flags=mean(flags)) %>% ggplot(aes(x=age, y=log(flags), colour = emoji_modifier)) + geom_point() + theme_minimal() + geom_smooth() + labs(caption="Figure 2.10: Log of Emperical Mean Flags by Age, by Emoji Modifier",x="Age", y = "log(Mean Flags)", colour = "Emoji Modifier") + theme(plot.caption = element_text(size = 11))
+
+#Plotting log means of flags by income to check for linearity
+#Interesting behaviour, weakly linear
+cust_dev_joined %>% group_by(hhld_median_inc) %>% summarise(flags=mean(flags)) %>% ggplot(aes(x=hhld_median_inc, y=log(flags))) + geom_point() + geom_smooth() + theme_minimal() + labs(title="Log of Emperical Mean Flags by Household Median Income",x="Household Median Income", y = "log(Mean Flags)")
+
+cust_dev_joined %>% group_by(hhld_median_inc, emoji_modifier) %>% summarise(flags=mean(flags)) %>% ggplot(aes(x=hhld_median_inc, y=log(flags), colour = emoji_modifier)) + geom_point() + theme_minimal() + geom_smooth() + labs(caption="Figure 2.11: Log of Emperical Mean Flags by Household Median Income, by Emoji Modifier",x="Household Median Income", y = "log(Mean Flags)", colour = "Emoji Modifier") + theme(plot.caption = element_text(size = 11))
+```
+
+```{r}
+#First attempt at a model
+#After testing other models later in the code, this one is just better
+model_base <- lme4::glmer(flags ~ factor(emoji_modifier) + (1|cust_id), family = poisson, offset = log(duration/60), data = cust_dev_joined)
+summary(model_base)
+lme4::VarCorr(model_base)
+```
+
+```{r}
+#Other models to be considered
+
+#0 coefficient models
+model_0a <- lme4::glmer(flags ~ (1|cust_id), family = poisson, offset = log(duration/60), data = cust_dev_joined)
+model_0b <- lme4::glmer(flags ~ (1|device_name), family = poisson, offset = log(duration/60), data = cust_dev_joined)
+model_0c <- lme4::glmer(flags ~ (1|cust_id) + (1|device_name), family = poisson, offset = log(duration/60), data = cust_dev_joined)
+
+#ANOVA shows model with only cust_id random intercept is the best
+anova(model_0a, model_base, test = "Chisq")
+anova(model_0b, model_base, test = "Chisq")
+anova(model_0c, model_base, test = "Chisq")
+
+#With device_name as random intercept
+model_0d <- lme4::glmer(flags ~ factor(emoji_modifier) + (1|cust_id) + (1|device_name), family = poisson, offset = log(duration/60), data = cust_dev_joined)
+#ANOVA shows device_name does not significantly improve the model
+anova(model_0d, model_base, test = "Chisq")
+```
+```{r}
+#1 coefficient models
+model_null <- glm(flags ~ 1, family = poisson, offset = log(duration/60), data = cust_dev_joined)
+model_1a <- glm(flags ~ age, family = poisson, offset = log(duration/60), data = cust_dev_joined)
+model_1b <- glm(flags ~ hhld_median_inc, family = poisson, offset = log(duration/60), data = cust_dev_joined)
+```
+```{r}
+#These are significant in the absence of our cust_id random intercept, but since we do have the intercept these effects are basically nested
+#So ignore this chunk pretty much
+anova(model_null, model_1a, test = "Chisq")
+anova(model_null, model_1b, test = "Chisq")
+```
+```{r}
+model_2a <- lme4::glmer(flags ~ factor(emoji_modifier) + factor(sex) + (1|cust_id), family = poisson, offset = log(duration/60), data = cust_dev_joined)
+
+anova(model_base, model_2a)
+```
+
+
+```{r}
+c_interval <- confint(model_base)
+exp(c_interval)
+```
+
+```{r}
+ests <- format(round(exp(summary(model_base)$coeff)[,1], 2), nsmall = 2)
+cis <- format(round(exp(c_interval),2)[-1,], nsmall = 2)
+conf_ints <- str_c("(", trimws(cis[,1]), ", ", cis[,2], ")")
+rownames_for_table <- c("Baseline rate", "U+1F3FB", "U+1F3FC", "U+1F3FD", "U+1F3FE", "U+1F3FF")
+colnames_for_table <- c("Estimate", "95% CI")
+table <- cbind(ests, conf_ints)
+rownames(table) <- rownames_for_table
+colnames(table) <- colnames_for_table
+knitr::kable(table, align = c("r", "r"))
+```
+```{r}
+cust_dev_joined %>% group_by(emoji_modifier) %>% ggplot(aes(x=device_name, fill=emoji_modifier)) + geom_bar() + theme_minimal() + facet_wrap(~emoji_modifier, nrow = 3)
+```
+
+```{r}
+res_int<- ranef(model_base)$cust_id$`(Intercept)`
+qqnorm(res_int)
+qqline(res_int)
+plot(model_base)
+```
+
